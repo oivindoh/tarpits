@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cilium-policy-updater-sa
+  namespace: ingress-nginx
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cilium-policy-updater-role
+  namespace: ingress-nginx
+rules:
+- apiGroups: ["cilium.io"]
+  resources: ["ciliumnetworkpolicies"]
+  verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cilium-policy-updater-binding
+  namespace: ingress-nginx
+subjects:
+- kind: ServiceAccount
+  name: cilium-policy-updater-sa
+  namespace: ingress-nginx
+roleRef:
+  kind: Role
+  name: cilium-policy-updater-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: update-cilium-ip-policy
+  namespace: ingress-nginx
+spec:
+  schedule: "0 */1 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: policy-updater
+            image: oivindoh/ssh-tarpit-policy-updater:latest
+            env:
+            - name: DB_HOST
+              value: "endlessh-pgdb.default.svc.cluster.local"
+            - name: DB_NAME
+              value: "postgres"
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: endlessh-pgdb
+                  key: superuser-username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: endlessh-pgdb
+                  key: superuser-password
+          restartPolicy: OnFailure
+          serviceAccountName: cilium-policy-updater-sa
