@@ -76,6 +76,7 @@ DB_CONFIG = {
 
 # Global set to track active tasks (not just connections)
 active_tasks = set()
+max_tasks = int(os.getenv("TARPIT_MAX_CONCURRENCY", 200))
 
 # Load GeoIP database
 ipdb_path = os.getenv('TARPIT_IPDB_PATH', '/ipnetdb_prefix_latest.mmdb') # https://cdn.ipnetdb.net/ipnetdb_prefix_latest.mmdb
@@ -124,7 +125,7 @@ RICKROLL = os.getenv('TARPIT_RICKROLL','False')
 from ipaddress import ip_network, collapse_addresses
 
 async def fetch_total_cidr_addresses(connection):
-    query = "SELECT net, prefix FROM ssh_connections"
+    query = "SELECT net, prefix FROM ssh_connections WHERE net is not null and prefix is not null"
     rows = await connection.fetch(query)
     
     net_networks = []
@@ -135,11 +136,11 @@ async def fetch_total_cidr_addresses(connection):
         try:
             net_networks.append(ip_network(row['net'], strict=False))
         except ValueError as e:
-            logger.error(f"Invalid net CIDR", extra={"cidr": str(row['net']), "error": e})
+            logger.error(f"Invalid net CIDR", extra={"cidr": str(row['net']), "error": str(e)})
         try:
             prefix_networks.append(ip_network(row['prefix'], strict=False))
         except ValueError as e:
-            logger.error(f"Invalid prefix CIDR", extra={"cidr": str(row['prefix']), "error": e})
+            logger.error(f"Invalid prefix CIDR", extra={"cidr": str(row['prefix']), "error": str(e)})
     
     # Collapse overlapping networks
     net_collapsed = list(collapse_addresses(net_networks))
@@ -331,6 +332,15 @@ def get_geodata(ip):
     return result
 
 async def handle_client(reader, writer, db_conn):
+    # Check active tasks count before proceeding
+    if len(active_tasks) > max_tasks:
+        logger.info(f"Active connections exceeded {max_tasks}. Restarting.")
+        # Send SIGTERM to the current process
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    # Your async connection code here
+    await asyncio.sleep(1)  # Example async operation
+
     client_addr = writer.get_extra_info('peername')
     client_ip = client_addr[0]
     client_port = client_addr[1]
