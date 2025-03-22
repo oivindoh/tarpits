@@ -2,14 +2,15 @@ import asyncio
 import socket
 import asyncpg
 from datetime import datetime
-import os
 import maxminddb
 import random
+import os
 import logging
 import json
 import hashlib
 import signal
 import ipaddress
+from ipaddress import ip_network, collapse_addresses
 
 class JsonFormatter(logging.Formatter):
     def format(self, record):
@@ -121,8 +122,6 @@ else:
     ENRICH_IPDB = False
 
 RICKROLL = os.getenv('TARPIT_RICKROLL','False')
-
-from ipaddress import ip_network, collapse_addresses
 
 async def fetch_total_cidr_addresses(connection):
     query = "SELECT net, prefix FROM ssh_connections WHERE net is not null and prefix is not null"
@@ -364,7 +363,7 @@ async def handle_client(reader, writer, db_conn):
     task = asyncio.current_task()
     active_tasks.add(task)
 
-    logger.info("Received connection", extra={"client_ip": client_ip, "version": client_version_str, "hash": client_hash})
+    logger.info("Received connection", extra={"client_ip": client_ip, "active_tasks": len(active_tasks), "version": client_version_str, "hash": client_hash})
     
     result = get_geodata(client_ip)
     await upsert_connection_start(db_conn, client_ip, result.get("country_code"), result.get("latitude"), result.get("longitude"), client_version_str, client_hash, result.get("allocated_net"), result.get("allocated_prefix"), result.get("allocated_asn"))
@@ -423,6 +422,8 @@ async def handle_client(reader, writer, db_conn):
             pass
         else:
             raise
+    except asyncio.CancelledError as e:
+        logger.info("Cancelling task, received expected CancelledError")
     finally:
         end_time = datetime.utcnow()
         duration_seconds = int((end_time - start_time).total_seconds())
@@ -434,21 +435,30 @@ async def handle_client(reader, writer, db_conn):
         except BrokenPipeError:
             pass
         active_tasks.discard(task)
+        logger.debug('Discarded task', extra={"task": str(task)})
 
 async def shutdown(db_conn, server, signal_name):
     logger.info(f"Received {signal_name}, closing all {len(active_tasks)} connections")
     
-    # Cancel all active client tasks
-    for task in active_tasks.copy():
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    for task in list(active_tasks):  # Convert to list to avoid set iteration issues
+        await asyncio.sleep(0.1)
+        if not task.done():
+            logger.debug("Canceling task", extra={"task": str(task)})
+
+            task.cancel()
+            await asyncio.sleep(0)  # Yield to event loop briefly
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    #await asyncio.wait(active_tasks,timeout=5)
     
     # Close server and database
+    logger.debug("Closing down server")
     server.close()
     await server.wait_closed()
+    logger.debug("Closing down DB")
     await db_conn.close()
     
     logger.info("Shutdown complete")
