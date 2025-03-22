@@ -12,6 +12,10 @@ import signal
 import ipaddress
 from ipaddress import ip_network, collapse_addresses
 
+class ShutdownException(Exception):
+    """Custom exception for task failure"""
+    pass
+
 class JsonFormatter(logging.Formatter):
     def format(self, record):
         log_data = {
@@ -402,6 +406,7 @@ async def handle_client(reader, writer, db_conn):
         sent = 0
         sent_bytes = 0
         while True:
+            await asyncio.sleep(random.uniform(0.5, 1))
             if sent < preamble_length and RICKROLL == 'True':
                 writer.write(preamble[sent])
                 sent_bytes = sent_bytes + len(preamble[sent])
@@ -410,7 +415,7 @@ async def handle_client(reader, writer, db_conn):
                 writer.write(b'%.2x\r\n' % random.randrange(2**8))
                 sent_bytes = sent_bytes + 4
             await writer.drain()
-            await asyncio.sleep(random.uniform(0.5, 1))
+            
             logger.debug("Sent data", extra={"client_ip": client_ip, "hash": client_hash})
     except (ConnectionResetError, BrokenPipeError) as e:
         logger.info("Client disconnected", extra={"client_ip": client_ip, "error": str(e), "hash": client_hash})
@@ -422,8 +427,8 @@ async def handle_client(reader, writer, db_conn):
             pass
         else:
             raise
-    except asyncio.CancelledError as e:
-        logger.info("Cancelling task, received expected CancelledError")
+    except (asyncio.CancelledError, ShutdownException) as e:
+        logger.info("Cancelling task, received expected shutdown exception")
     finally:
         end_time = datetime.utcnow()
         duration_seconds = int((end_time - start_time).total_seconds())
@@ -443,15 +448,15 @@ async def shutdown(db_conn, server, signal_name):
     for task in list(active_tasks):  # Convert to list to avoid set iteration issues
         await asyncio.sleep(0.1)
         if not task.done():
-            logger.debug("Canceling task", extra={"task": str(task)})
-
+            logger.debug("Canceling task", extra={"task": str(task)})            
             task.cancel()
             await asyncio.sleep(0)  # Yield to event loop briefly
             try:
                 await task
             except asyncio.CancelledError:
                 pass
-
+            
+            
     #await asyncio.wait(active_tasks,timeout=5)
     
     # Close server and database
