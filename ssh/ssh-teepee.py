@@ -81,7 +81,7 @@ DB_CONFIG = {
 
 # Global set to track active tasks (not just connections)
 active_tasks = set()
-max_tasks = int(os.getenv("TARPIT_MAX_CONCURRENCY", 200))
+max_tasks = int(os.getenv("TARPIT_MAX_CONCURRENCY", '200'))
 
 # Load GeoIP database
 ipdb_path = os.getenv('TARPIT_IPDB_PATH', '/ipnetdb_prefix_latest.mmdb') # https://cdn.ipnetdb.net/ipnetdb_prefix_latest.mmdb
@@ -127,33 +127,38 @@ else:
 
 RICKROLL = os.getenv('TARPIT_RICKROLL','False')
 
-async def fetch_total_cidr_addresses(connection):
-    query = "SELECT net, prefix FROM ssh_connections WHERE net is not null and prefix is not null"
-    rows = await connection.fetch(query)
+async def init_pool():
+    global pool
+    pool = await asyncpg.create_pool(**DB_CONFIG, min_size=1, max_size=20)
+
+async def fetch_total_cidr_addresses():
+    async with pool.acquire() as conn:
+        query = "SELECT net, prefix FROM ssh_connections WHERE net is not null and prefix is not null"
+        rows = await conn.fetch(query)
     
-    net_networks = []
-    prefix_networks = []
-    
-    # Collect valid networks
-    for row in rows:
-        try:
-            net_networks.append(ip_network(row['net'], strict=False))
-        except ValueError as e:
-            logger.error(f"Invalid net CIDR", extra={"cidr": str(row['net']), "error": str(e)})
-        try:
-            prefix_networks.append(ip_network(row['prefix'], strict=False))
-        except ValueError as e:
-            logger.error(f"Invalid prefix CIDR", extra={"cidr": str(row['prefix']), "error": str(e)})
-    
-    # Collapse overlapping networks
-    net_collapsed = list(collapse_addresses(net_networks))
-    prefix_collapsed = list(collapse_addresses(prefix_networks))
-    
-    # Sum the totals
-    net_total = sum(net.num_addresses for net in net_collapsed)
-    prefix_total = sum(prefix.num_addresses for prefix in prefix_collapsed)
-    
-    return net_total, prefix_total
+        net_networks = []
+        prefix_networks = []
+        
+        # Collect valid networks
+        for row in rows:
+            try:
+                net_networks.append(ip_network(row['net'], strict=False))
+            except ValueError as e:
+                logger.error(f"Invalid net CIDR", extra={"cidr": str(row['net']), "error": str(e)})
+            try:
+                prefix_networks.append(ip_network(row['prefix'], strict=False))
+            except ValueError as e:
+                logger.error(f"Invalid prefix CIDR", extra={"cidr": str(row['prefix']), "error": str(e)})
+        
+        # Collapse overlapping networks
+        net_collapsed = list(collapse_addresses(net_networks))
+        prefix_collapsed = list(collapse_addresses(prefix_networks))
+        
+        # Sum the totals
+        net_total = sum(net.num_addresses for net in net_collapsed)
+        prefix_total = sum(prefix.num_addresses for prefix in prefix_collapsed)
+        
+        return net_total, prefix_total
 
 def create_stable_hash(client_ip: str, client_string: str, client_port: int) -> str:
     # Normalize inputs
@@ -191,150 +196,166 @@ async def wait_for_db(max_attempts=30, initial_delay=2):
             delay = min(delay * 2, 30)
 
 # Initialize the database table
-async def init_db(conn):
-    # Main connections table (removed client_version)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS ssh_connections (
-            client_ip INET PRIMARY KEY,
-            connections BIGINT DEFAULT 1,
-            first_seen TIMESTAMP WITH TIME ZONE NOT NULL,
-            last_seen TIMESTAMP WITH TIME ZONE NOT NULL,
-            total_time_wasted BIGINT DEFAULT 0,
-            active_connections BIGINT DEFAULT 0,
-            country_code CHAR(2),
-            latitude DOUBLE PRECISION,
-            longitude DOUBLE PRECISION,
-            last_updated TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            max_concurrent BIGINT DEFAULT 0,
-            asn BIGINT,
-            prefix INET,
-            net INET,
-            sent_bytes BIGINT DEFAULT 0
-        );
-    """)
-    await conn.execute("""
-        UPDATE ssh_connections 
-        SET max_concurrent = GREATEST(max_concurrent, active_connections)
-        WHERE max_concurrent < active_connections;
-    """)
-    logger.info("Resetting stale active connections")
-    reset_rows = await conn.fetch("""
-        UPDATE ssh_connections 
-        SET active_connections = 0 
-        WHERE active_connections != 0 
-        AND last_updated < NOW() - INTERVAL '5 minutes'
-        RETURNING client_ip, active_connections AS old_active;
-    """)
-    if reset_rows:
-        for row in reset_rows:
-            logger.info("Reset active connection", extra={"client_ip": str(row['client_ip']), "old_active": row['old_active']})
-    else:
-        logger.info("No stale active connections to reset")
-
-    # Table for unique client versions
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS client_versions (
-            id SERIAL PRIMARY KEY,
-            version TEXT UNIQUE NOT NULL
-        );
-    """)
-
-    # Junction table to link IPs to client versions
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS ip_client_versions (
-            client_ip INET REFERENCES ssh_connections(client_ip),
-            version_id INTEGER REFERENCES client_versions(id),
-            first_seen TIMESTAMP WITH TIME ZONE NOT NULL,
-            last_seen TIMESTAMP WITH TIME ZONE NOT NULL,
-            PRIMARY KEY (client_ip, version_id)
-        );
-    """)
-
-async def upsert_connection_start(conn, client_ip, country_code, latitude, longitude, client_version, client_hash, net, prefix, asn):
-    now = datetime.utcnow()
-    async with conn.transaction():
-        # Upsert into ssh_connections
-        active = await conn.fetchval("""
-            INSERT INTO ssh_connections (
-                client_ip, first_seen, last_seen, country_code, 
-                latitude, longitude, active_connections, last_updated, max_concurrent,
-                net, prefix, asn
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, 1, $7, 1, $8, $9, $10)
-            ON CONFLICT (client_ip)
-            DO UPDATE SET
-                connections = ssh_connections.connections + 1,
-                last_seen = EXCLUDED.last_seen,
-                active_connections = ssh_connections.active_connections + 1,
-                last_updated = EXCLUDED.last_updated,
-                max_concurrent = GREATEST(ssh_connections.max_concurrent, ssh_connections.active_connections + 1)
-            RETURNING active_connections;
-        """, client_ip, now, now, country_code, latitude, longitude, now, net, prefix, asn)
-        logger.debug("Stored start of connection", extra={"client_ip": str(client_ip), "active_connections": active, "hash": client_hash})
-
-        # Upsert client version into client_versions
-        version_id = await conn.fetchval("""
-            INSERT INTO client_versions (version)
-            VALUES ($1)
-            ON CONFLICT (version)
-            DO UPDATE SET version = EXCLUDED.version
-            RETURNING id;
-        """, client_version)
-
-        # Link IP to client version in ip_client_versions
+async def init_db():
+    async with pool.acquire() as conn:
+        # Main connections table (removed client_version)
         await conn.execute("""
-            INSERT INTO ip_client_versions (client_ip, version_id, first_seen, last_seen)
-            VALUES ($1, $2, $3, $3)
-            ON CONFLICT (client_ip, version_id)
-            DO UPDATE SET last_seen = EXCLUDED.last_seen;
-        """, client_ip, version_id, now)
+            CREATE TABLE IF NOT EXISTS ssh_connections (
+                client_ip INET PRIMARY KEY,
+                connections BIGINT DEFAULT 1,
+                first_seen TIMESTAMP WITH TIME ZONE NOT NULL,
+                last_seen TIMESTAMP WITH TIME ZONE NOT NULL,
+                total_time_wasted BIGINT DEFAULT 0,
+                active_connections BIGINT DEFAULT 0,
+                country_code CHAR(2),
+                latitude DOUBLE PRECISION,
+                longitude DOUBLE PRECISION,
+                last_updated TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                max_concurrent BIGINT DEFAULT 0,
+                asn BIGINT,
+                prefix INET,
+                net INET,
+                sent_bytes BIGINT DEFAULT 0
+            );
+        """)
+        await conn.execute("""
+            UPDATE ssh_connections 
+            SET max_concurrent = GREATEST(max_concurrent, active_connections)
+            WHERE max_concurrent < active_connections;
+        """)
+        logger.info("Resetting stale active connections")
+        reset_rows = await conn.fetch("""
+            UPDATE ssh_connections 
+            SET active_connections = 0 
+            WHERE active_connections != 0 
+            AND last_updated < NOW() - INTERVAL '5 minutes'
+            RETURNING client_ip, active_connections AS old_active;
+        """)
+        if reset_rows:
+            for row in reset_rows:
+                logger.info("Reset active connection", extra={"client_ip": str(row['client_ip']), "old_active": row['old_active']})
+        else:
+            logger.info("No stale active connections to reset")
 
-async def upsert_connection_end(conn, client_ip, duration_seconds, client_hash, sent_bytes):
+        # Table for unique client versions
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS client_versions (
+                id SERIAL PRIMARY KEY,
+                version TEXT UNIQUE NOT NULL
+            );
+        """)
+
+        # Junction table to link IPs to client versions
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS ip_client_versions (
+                client_ip INET REFERENCES ssh_connections(client_ip),
+                version_id INTEGER REFERENCES client_versions(id),
+                first_seen TIMESTAMP WITH TIME ZONE NOT NULL,
+                last_seen TIMESTAMP WITH TIME ZONE NOT NULL,
+                PRIMARY KEY (client_ip, version_id)
+            );
+        """)
+
+async def upsert_connection_start(client_ip, country_code, latitude, longitude, client_version, client_hash, net, prefix, asn):
+    logger.debug('Database storing started', extra={"client_ip": client_ip})
     now = datetime.utcnow()
-    active = await conn.fetchval("""
-        UPDATE ssh_connections
-        SET
-            last_seen = $1,
-            total_time_wasted = total_time_wasted + $2,
-            active_connections = GREATEST(active_connections - 1, 0),
-            last_updated = $3,
-            sent_bytes = sent_bytes + $5
-        WHERE client_ip = $4
-        RETURNING active_connections;
-    """, now, duration_seconds, now, client_ip, sent_bytes)
-    logger.debug("Stored end of connection", extra={"client_ip": str(client_ip), "active_connections": active, "duration_seconds": duration_seconds, "hash": client_hash, "sent_bytes": sent_bytes})
+    try:
+        async with pool.acquire() as conn:
+            # Upsert into ssh_connections
+            active = await conn.fetchval("""
+                INSERT INTO ssh_connections (
+                    client_ip, first_seen, last_seen, country_code, 
+                    latitude, longitude, active_connections, last_updated, max_concurrent,
+                    net, prefix, asn
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, 1, $7, 1, $8, $9, $10)
+                ON CONFLICT (client_ip)
+                DO UPDATE SET
+                    connections = ssh_connections.connections + 1,
+                    last_seen = EXCLUDED.last_seen,
+                    active_connections = ssh_connections.active_connections + 1,
+                    last_updated = EXCLUDED.last_updated,
+                    max_concurrent = GREATEST(ssh_connections.max_concurrent, ssh_connections.active_connections + 1)
+                RETURNING active_connections;
+            """, client_ip, now, now, country_code, latitude, longitude, now, net, prefix, asn)
+            logger.debug("Stored start of connection", extra={"client_ip": str(client_ip), "active_connections": active, "hash": client_hash})
+
+            # Upsert client version into client_versions
+            version_id = await conn.fetchval("""
+                INSERT INTO client_versions (version)
+                VALUES ($1)
+                ON CONFLICT (version)
+                DO UPDATE SET version = EXCLUDED.version
+                RETURNING id;
+            """, client_version)
+
+            # Link IP to client version in ip_client_versions
+            await conn.execute("""
+                INSERT INTO ip_client_versions (client_ip, version_id, first_seen, last_seen)
+                VALUES ($1, $2, $3, $3)
+                ON CONFLICT (client_ip, version_id)
+                DO UPDATE SET last_seen = EXCLUDED.last_seen;
+            """, client_ip, version_id, now)
+    except Exception as e:
+        logger.error("Unexpected error storing connection start", exc_info=e, extra={"client_ip": str(client_ip), "hash": client_hash})
+
+async def upsert_connection_end(client_ip, duration_seconds, client_hash, sent_bytes):
+    now = datetime.utcnow()
+    try:
+        async with pool.acquire() as conn:
+            active = await conn.fetchval("""
+                UPDATE ssh_connections
+                SET
+                    last_seen = $1,
+                    total_time_wasted = total_time_wasted + $2,
+                    active_connections = GREATEST(active_connections - 1, 0),
+                    last_updated = $3,
+                    sent_bytes = sent_bytes + $5
+                WHERE client_ip = $4
+                RETURNING active_connections;
+            """, now, duration_seconds, now, client_ip, sent_bytes)
+            logger.debug("Stored end of connection", extra={"client_ip": str(client_ip), "active_connections": active, "duration_seconds": duration_seconds, "hash": client_hash, "sent_bytes": sent_bytes})
+    except Exception as e:
+        logger.error("Unexpected error storing connection end", exc_info=e, extra={"client_ip": str(client_ip), "hash": client_hash})
+
+
 
 # Get geodata from IP (extract country code and coordinates)
-def get_geodata(ip):
+async def get_geodata(ip):
     result = {}
     class GeoException(Exception):
         pass
     class IPDBException(Exception):
         pass
+    
+    loop = asyncio.get_event_loop()
+    
     try:
         if ENRICH_GEOIP:
-            geodata = GEOIP_DATABASE.get(str(ip))
-            if geodata != None:
-                result["country_code"] = geodata.get("country", {}).get("iso_code")  # e.g., 'NO' or None
-                result["latitude"] = geodata.get("location", {}).get("latitude")     # e.g., 59.9452 or None
-                result["longitude"] = geodata.get("location", {}).get("longitude")   # e.g., 10.7559 or None
+            geodata = await loop.run_in_executor(None, GEOIP_DATABASE.get, str(ip))
+            if geodata is not None:
+                result["country_code"] = geodata.get("country", {}).get("iso_code")
+                result["latitude"] = geodata.get("location", {}).get("latitude")
+                result["longitude"] = geodata.get("location", {}).get("longitude")
             else:
                 raise GeoException(f"No GeoIP-data found for {ip}")
+                
         if ENRICH_IPDB:
-            ipdbdata = IPDB_DATABASE.get(str(ip).split('::ffff:')[-1])
-            if ipdbdata != None:
-                result["allocated_net"] = ipdbdata.get("allocation")    # e.g., value or None
-                result["allocated_prefix"] = ipdbdata.get("prefix")     # e.g., value or None
-                result["allocated_asn"] = ipdbdata.get("as")             # e.g., value or None
+            ipdbdata = await loop.run_in_executor(None, IPDB_DATABASE.get, str(ip).split('::ffff:')[-1])
+            if ipdbdata is not None:
+                result["allocated_net"] = ipdbdata.get("allocation")
+                result["allocated_prefix"] = ipdbdata.get("prefix")
+                result["allocated_asn"] = ipdbdata.get("as")
             else:
                 raise IPDBException(f"No IPDB-data found for {ip}")
+                
     except (GeoException, IPDBException) as e:
         logger.error("Enrich failed", extra={"ip": ip, "error": str(e)})
 
     logger.debug(result)
     return result
 
-async def handle_client(reader, writer, db_conn):
+async def handle_client(reader, writer):
     # Check active tasks count before proceeding
     if len(active_tasks) > max_tasks:
         logger.info(f"Active connections exceeded {max_tasks}. Restarting.")
@@ -369,8 +390,8 @@ async def handle_client(reader, writer, db_conn):
 
     logger.info("Received connection", extra={"client_ip": client_ip, "active_tasks": len(active_tasks), "version": client_version_str, "hash": client_hash})
     
-    result = get_geodata(client_ip)
-    await upsert_connection_start(db_conn, client_ip, result.get("country_code"), result.get("latitude"), result.get("longitude"), client_version_str, client_hash, result.get("allocated_net"), result.get("allocated_prefix"), result.get("allocated_asn"))
+    result = await get_geodata(client_ip)
+    await upsert_connection_start(client_ip, result.get("country_code"), result.get("latitude"), result.get("longitude"), client_version_str, client_hash, result.get("allocated_net"), result.get("allocated_prefix"), result.get("allocated_asn"))
 
     sock = writer.transport.get_extra_info('socket')
     if sock:
@@ -432,7 +453,7 @@ async def handle_client(reader, writer, db_conn):
     finally:
         end_time = datetime.utcnow()
         duration_seconds = int((end_time - start_time).total_seconds())
-        await upsert_connection_end(db_conn, client_ip, duration_seconds, client_hash, sent_bytes)
+        await upsert_connection_end(client_ip, duration_seconds, client_hash, sent_bytes)
         logger.info("Connection closed", extra={"client_ip": client_ip, "duration_seconds": duration_seconds, "hash": client_hash})
         writer.close()
         try:
@@ -442,7 +463,7 @@ async def handle_client(reader, writer, db_conn):
         active_tasks.discard(task)
         logger.debug('Discarded task', extra={"task": str(task)})
 
-async def shutdown(db_conn, server, signal_name):
+async def shutdown(server, signal_name):
     logger.info(f"Received {signal_name}, closing all {len(active_tasks)} connections")
     
     for task in list(active_tasks):  # Convert to list to avoid set iteration issues
@@ -464,7 +485,7 @@ async def shutdown(db_conn, server, signal_name):
     server.close()
     await server.wait_closed()
     logger.debug("Closing down DB")
-    await db_conn.close()
+    await pool.close()
     
     logger.info("Shutdown complete")
     for handler in logger.handlers:
@@ -476,10 +497,11 @@ async def main():
     if not await wait_for_db(max_attempts=30, initial_delay=2):
         logger.error("Failed to connect to database. Exiting")
         return
+    
+    await init_pool()
+    await init_db()
 
-    db_conn = await asyncpg.connect(**DB_CONFIG)
-    await init_db(db_conn)
-    net_total, prefix_total = await fetch_total_cidr_addresses(db_conn)
+    net_total, prefix_total = await fetch_total_cidr_addresses()
 
     server_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
@@ -487,7 +509,7 @@ async def main():
     server_socket.listen()
 
     server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, db_conn),
+        lambda r, w: handle_client(r, w),
         sock=server_socket
     )
     logger.info("SSH tarpit running", extra={"address": "[::]:2222"})
@@ -500,7 +522,7 @@ async def main():
     def handle_signal(sig):
         nonlocal shutdown_task
         if shutdown_task is None:
-            shutdown_task = asyncio.create_task(shutdown(db_conn, server, sig.name))
+            shutdown_task = asyncio.create_task(shutdown(server, sig.name))
             logger.debug(f"Signal {sig.name} received and shutdown task created")
 
     signals = [signal.SIGINT]
