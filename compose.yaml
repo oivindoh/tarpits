@@ -30,9 +30,9 @@ services:
       - TARPIT_MMDB_KEY=${TARPIT_MMDB_KEY}
       - TARPIT_MAX_CONCURRENCY=3
     volumes:
-      - "./GeoLite2-City.mmdb:/GeoLite2-City.mmdb"
-      - "./GeoLite2-Country.mmdb:/GeoLite2-Country.mmdb"
-      - "./ipnetdb_prefix_latest.mmdb:/ipnetdb_prefix_latest.mmdb"
+      - "./extras/GeoLite2-City.mmdb:/GeoLite2-City.mmdb"
+      - "./extras/GeoLite2-Country.mmdb:/GeoLite2-Country.mmdb"
+      - "./extras/ipnetdb_prefix_latest.mmdb:/ipnetdb_prefix_latest.mmdb"
     develop:
       watch:
         - action: rebuild
