@@ -28,6 +28,7 @@ services:
       - TARPIT_LOG_LEVEL=DEBUG
       - TARPIT_RICKROLL=True
       - TARPIT_MMDB_KEY=${TARPIT_MMDB_KEY}
+      - TARPIT_MAX_CONCURRENCY=3
     volumes:
       - "./GeoLite2-City.mmdb:/GeoLite2-City.mmdb"
       - "./GeoLite2-Country.mmdb:/GeoLite2-Country.mmdb"
