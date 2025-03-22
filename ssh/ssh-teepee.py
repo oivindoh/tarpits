@@ -476,10 +476,6 @@ async def shutdown(server, signal_name):
                 await task
             except asyncio.CancelledError:
                 pass
-            
-            
-    #await asyncio.wait(active_tasks,timeout=5)
-    
     # Close server and database
     logger.debug("Closing down server")
     server.close()
@@ -487,7 +483,10 @@ async def shutdown(server, signal_name):
     logger.debug("Closing down DB")
     await pool.close()
     
-    logger.info("Shutdown complete")
+    logger.info(f"Shutdown complete.")
+    if len(active_tasks) > 0:
+        logger.info(f"Sleeping a little bit extra before getting wrecked because there are {len(active_tasks)} tasks active", extra={"tasks": str(active_tasks)})
+        await asyncio.wait(active_tasks,timeout=len(active_tasks))
     for handler in logger.handlers:
         handler.flush()
 
