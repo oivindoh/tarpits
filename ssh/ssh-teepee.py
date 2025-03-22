@@ -316,7 +316,7 @@ async def upsert_connection_end(client_ip, duration_seconds, client_hash, sent_b
             """, now, duration_seconds, now, client_ip, sent_bytes)
             logger.debug("Stored end of connection", extra={"client_ip": str(client_ip), "active_connections": active, "duration_seconds": duration_seconds, "hash": client_hash, "sent_bytes": sent_bytes})
     except Exception as e:
-        logger.error("Unexpected error storing connection end", exc_info=e, extra={"client_ip": str(client_ip), "hash": client_hash})
+        logger.error("Unexpected error storing connection end", extra={"client_ip": str(client_ip), "hash": client_hash, "err": str(e)})
 
 
 
