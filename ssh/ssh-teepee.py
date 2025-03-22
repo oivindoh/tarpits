@@ -129,7 +129,7 @@ RICKROLL = os.getenv('TARPIT_RICKROLL','False')
 
 async def init_pool():
     global pool
-    pool = await asyncpg.create_pool(**DB_CONFIG, min_size=1, max_size=20)
+    pool = await asyncpg.create_pool(**DB_CONFIG, min_size=1, max_size=32)
 
 async def fetch_total_cidr_addresses():
     async with pool.acquire() as conn:
