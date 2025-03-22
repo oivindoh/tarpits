@@ -297,7 +297,7 @@ async def upsert_connection_start(client_ip, country_code, latitude, longitude, 
                 DO UPDATE SET last_seen = EXCLUDED.last_seen;
             """, client_ip, version_id, now)
     except Exception as e:
-        logger.error("Unexpected error storing connection start", exc_info=e, extra={"client_ip": str(client_ip), "hash": client_hash})
+        logger.error("Unexpected error storing connection start", extra={"client_ip": str(client_ip), "hash": client_hash, "err": str(e)})
 
 async def upsert_connection_end(client_ip, duration_seconds, client_hash, sent_bytes):
     now = datetime.utcnow()
@@ -334,25 +334,25 @@ async def get_geodata(ip):
         if ENRICH_GEOIP:
             geodata = await loop.run_in_executor(None, GEOIP_DATABASE.get, str(ip))
             if geodata is not None:
-                result["country_code"] = geodata.get("country", {}).get("iso_code")
-                result["latitude"] = geodata.get("location", {}).get("latitude")
-                result["longitude"] = geodata.get("location", {}).get("longitude")
+                result["country_code"] = geodata.get("country", {}).get("iso_code") or None
+                result["latitude"] = geodata.get("location", {}).get("latitude") or None
+                result["longitude"] = geodata.get("location", {}).get("longitude") or None
             else:
                 raise GeoException(f"No GeoIP-data found for {ip}")
                 
         if ENRICH_IPDB:
             ipdbdata = await loop.run_in_executor(None, IPDB_DATABASE.get, str(ip).split('::ffff:')[-1])
             if ipdbdata is not None:
-                result["allocated_net"] = ipdbdata.get("allocation")
-                result["allocated_prefix"] = ipdbdata.get("prefix")
-                result["allocated_asn"] = ipdbdata.get("as")
+                result["allocated_net"] = ipdbdata.get("allocation") or None
+                result["allocated_prefix"] = ipdbdata.get("prefix") or None
+                result["allocated_asn"] = ipdbdata.get("as") or None
             else:
                 raise IPDBException(f"No IPDB-data found for {ip}")
                 
     except (GeoException, IPDBException) as e:
         logger.error("Enrich failed", extra={"ip": ip, "error": str(e)})
 
-    logger.debug(result)
+    logger.debug("Got geo/asn result", extra={"ip": str(ip), "result": result})
     return result
 
 async def handle_client(reader, writer):
